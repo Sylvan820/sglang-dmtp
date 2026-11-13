@@ -309,6 +309,12 @@ class SpeculativeAlgorithm(Enum):
         )
 
         if self.is_dflash():
+            import os
+
+            if os.getenv("SGLANG_DMTP_QSA", "0") == "1":
+                from sglang.srt.speculative.dmtp_qsa_worker import QSAMTPWorker
+
+                return QSAMTPWorker
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2

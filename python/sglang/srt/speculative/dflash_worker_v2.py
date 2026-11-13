@@ -395,6 +395,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
+        self._dmtp_controller = None
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
@@ -2396,6 +2397,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+            if self._dmtp_controller is not None:
+                self._dmtp_controller.prefill(batch, next_token_ids, logits_output.dmtp_target_hc)
+                logits_output.dmtp_target_hc = None
             logits_output.hidden_states = None
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
@@ -2552,6 +2556,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
+        if self._dmtp_controller is not None:
+            self._dmtp_controller.prepare(batch, block_ids)
         if self._full_embed_gpu is not None:
             # Replicated lookup avoids the mismatched attn-TP all_reduce
             # inside VocabParallelEmbedding under dp attention.
@@ -2562,6 +2568,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:
             noise_embedding = noise_embedding * self._noise_embed_scale
+        if self._dmtp_controller is not None:
+            self._dmtp_controller.condition(noise_embedding)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
@@ -2670,7 +2678,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if (
+        if self._dmtp_controller is not None:
+            draft_next = self._dmtp_controller.propose(
+                batch, draft_logits_output.hidden_states.view(bs, block_size, -1)
+            )
+        elif (
             self._is_domino
             and self._draft_sampler is not None
             and draft_out.can_run_graph
@@ -2957,6 +2969,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
+
+        if self._dmtp_controller is not None:
+            self._dmtp_controller.commit(
+                batch, draft_tokens, commit_lens, bonus, new_seq_lens,
+                verify_out_cache_loc_2d, logits_output.dmtp_target_hc,
+            )
+            logits_output.dmtp_target_hc = None
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
