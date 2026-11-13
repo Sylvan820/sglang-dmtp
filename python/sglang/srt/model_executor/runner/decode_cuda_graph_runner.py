@@ -1648,6 +1648,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                dmtp_target_hc=(
+                    output.dmtp_target_hc[: self.raw_num_token]
+                    if output.dmtp_target_hc is not None
+                    else None
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)
