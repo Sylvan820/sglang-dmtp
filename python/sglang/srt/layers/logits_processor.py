@@ -223,6 +223,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Separate from DFlash's completed-layer means and from the H-wide head input.
+    dmtp_target_hc: Optional[torch.Tensor] = None
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
