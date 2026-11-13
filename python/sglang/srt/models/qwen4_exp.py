@@ -2106,6 +2106,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
             normalized_input = norms.output
+            if i in getattr(self, "_dflash_completed_layer_ids", ()):
+                assert not shards_rows, "DFlash2 capture is validated for TP1/CP1"
+                assert hidden_states.shape[-1] == self.hc_count * self.hidden_size
+                aux_hidden_states.append(
+                    hidden_states.unflatten(-1, (self.hc_count, self.hidden_size)).mean(dim=-2)
+                )
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2135,6 +2141,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 if capture is not None and capture.need_capture()
                 else None
             )
+        if getattr(self, "_dmtp_capture_hc", False):
+            # A graph-owned output, not a Python hook which only runs at capture.
+            self.last_dmtp_hc = hc_hidden_states.clone()
+        if getattr(self, "_dflash_completed_layer_ids", ()):
+            return hidden_states, aux_hidden_states
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
@@ -2179,6 +2190,8 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         )
         if isinstance(model_output, PPProxyTensors):
             return model_output
+        if getattr(self, "_dflash_completed_layer_ids", ()):
+            return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
@@ -2216,6 +2229,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+    def set_dflash_layers_to_capture(self, layer_ids):
+        assert self.pp_group.is_last_rank
+        assert list(layer_ids) == [5, 15, 25, 35, 45], layer_ids
+        self.capture_aux_hidden_states = True
+        self.model._dflash_completed_layer_ids = tuple(layer_ids)
+        for layer in self.model.layers:
+            layer._is_layer_to_capture = False
+
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
@@ -2240,6 +2261,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
+        if getattr(self.model, "_dmtp_capture_hc", False) and isinstance(output, LogitsProcessorOutput):
+            output.dmtp_target_hc = self.model.last_dmtp_hc
         return output
 
     def _load_qwen4_exp_ple_buffer(
