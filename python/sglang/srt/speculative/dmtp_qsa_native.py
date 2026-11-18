@@ -122,8 +122,9 @@ class NativeQSAMTP:
         def deterministic_forward(*args, **kwargs):
             # Both runner.forward and native graph capture call this private
             # model. Do not enable deterministic policies on the Target.
-            with self.execution_scope(), scoped_config(
-                enable_deterministic_inference=True
+            with (
+                self.execution_scope(),
+                scoped_config(enable_deterministic_inference=True),
             ):
                 return original(*args, **kwargs)
 
@@ -294,8 +295,31 @@ class NativeQSAMTP:
             self.graph = QSAMTPGraph(self)
 
     @torch.no_grad()
-    def forward(self, *, tokens, hc, req_indices, locations, prefixes, lengths, decode):
-        if (
+    def forward(
+        self,
+        *,
+        tokens,
+        hc,
+        req_indices,
+        locations,
+        prefixes,
+        lengths,
+        decode,
+        prepared=None,
+    ):
+        gpu_only = prepared is not None and getattr(prepared, "gpu_only", False)
+        bs = req_indices.numel()
+        if gpu_only:
+            if (
+                not decode
+                or prefixes is not None
+                or lengths is not None
+                or tokens.numel() != bs * 8
+                or hc.shape[0] != bs * 8
+                or locations.numel() != bs * 8
+            ):
+                raise ValueError("Invalid fixed-capacity GPU QSA commit")
+        elif (
             tokens.numel() != sum(lengths)
             or hc.shape[0] != tokens.numel()
             or locations.numel() != tokens.numel()
@@ -304,18 +328,66 @@ class NativeQSAMTP:
             or any(n < 1 for n in lengths)
         ):
             raise ValueError("QSA MTP token/HC/slot rows are misaligned")
-        if decode and any(n > 8 for n in lengths):
+        if decode and not gpu_only and any(n > 8 for n in lengths):
             raise ValueError("QSA continuation exceeds the accepted block width")
         if not decode and any(prefixes):
             raise ValueError("Only initial zero-prefix MTP prefill may use EXTEND")
         device = tokens.device
-        lens = torch.tensor(lengths, dtype=torch.int32, device=device)
-        prefix = torch.tensor(prefixes, dtype=torch.int32, device=device)
-        totals = prefix + lens
-        positions = torch.cat(
-            [torch.arange(p, p + n, device=device) for p, n in zip(prefixes, lengths)]
+        fused_prepare = prepared is not None or (
+            decode and os.getenv("SGLANG_DMTP_QSA_FUSED_PREPARE", "0") == "1"
         )
-        if getattr(self, "private_mapping", None) is not None:
+        if prepared is not None:
+            if (
+                not decode
+                or self.graph is None
+                or not self.graph.fused_prepare
+                or prepared.buffers is not self.graph.input_staging
+                or prepared.host_lengths != lengths
+                or prepared.host_prefixes != prefixes
+                or prepared.rows != tokens.numel()
+            ):
+                raise ValueError("QSA prepared commit does not own this graph input")
+            lens, prefix, totals = prepared.lens, prepared.prefix, prepared.totals
+            positions, starts, mrope = (
+                prepared.positions,
+                prepared.start,
+                prepared.mrope,
+            )
+            correct, select = prepared.correct, prepared.select
+        elif fused_prepare:
+            from sglang.srt.speculative.dmtp_qsa_pack import prepare_append
+
+            mapping = getattr(self, "private_mapping", None)
+            (
+                lens,
+                prefix,
+                totals,
+                positions,
+                locations,
+                starts,
+                mrope,
+                correct,
+                select,
+            ) = prepare_append(
+                req_indices,
+                prefixes,
+                lengths,
+                locations,
+                mapping.req_to_token if mapping is not None else None,
+            )
+        else:
+            lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+            prefix = torch.tensor(prefixes, dtype=torch.int32, device=device)
+            totals = prefix + lens
+            positions = torch.cat(
+                [
+                    torch.arange(p, p + n, device=device)
+                    for p, n in zip(prefixes, lengths)
+                ]
+            )
+            starts = lens.cumsum(0, dtype=torch.int32) - lens
+            mrope = positions[None].expand(3, -1).contiguous()
+        if not fused_prepare and getattr(self, "private_mapping", None) is not None:
             if any(
                 p + n > self.private_mapping.max_context_len
                 for p, n in zip(prefixes, lengths)
@@ -324,36 +396,75 @@ class NativeQSAMTP:
             locations = self._private_locations(req_indices, lens, positions)
             if not decode:
                 self._reset_private_ring(req_indices)
-        batch = ForwardBatch(
+        cache_batch = (
+            decode
+            and not gpu_only
+            and os.getenv("SGLANG_DMTP_QSA_CACHED_BATCH", "0") == "1"
+        )
+        totals_cpu = None if gpu_only else [p + n for p, n in zip(prefixes, lengths)]
+        batch_fields = dict(
             forward_mode=ForwardMode.DRAFT_EXTEND_V2 if decode else ForwardMode.EXTEND,
-            batch_size=len(lengths),
+            batch_size=bs,
             input_ids=tokens,
             req_pool_indices=req_indices,
             seq_lens=totals,
-            seq_lens_cpu=torch.tensor(
-                [p + n for p, n in zip(prefixes, lengths)], dtype=torch.int32
-            ),
-            seq_lens_sum=sum(prefixes) + sum(lengths),
+            seq_lens_cpu=None,
+            seq_lens_sum=None if gpu_only else sum(totals_cpu),
             positions=positions,
             out_cache_loc=locations,
-            extend_num_tokens=sum(lengths),
+            extend_num_tokens=tokens.numel(),
             extend_seq_lens=lens,
             extend_prefix_lens=prefix,
-            extend_start_loc=lens.cumsum(0, dtype=torch.int32) - lens,
+            extend_start_loc=starts,
             extend_seq_lens_cpu=lengths,
             extend_prefix_lens_cpu=prefixes,
-            extend_logprob_start_lens_cpu=[n - 1 for n in lengths],
+            extend_logprob_start_lens_cpu=None
+            if gpu_only
+            else [n - 1 for n in lengths],
             spec_algorithm=SpeculativeAlgorithm.EAGLE,
-            spec_info=SimpleNamespace(
-                hidden_states=hc, custom_mask=None, kv_indptr=None
-            ),
+            spec_info=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if getattr(self, "hidden_only", False)
                 else CaptureHiddenMode.LAST
             ),
-            mrope_positions=positions[None].expand(3, -1).contiguous(),
+            mrope_positions=mrope,
         )
+        spec_fields = None
+        if decode:
+            from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+            spec_fields = dict(
+                hidden_states=hc,
+                num_correct_drafts=correct if fused_prepare else lens - 1,
+                num_accept_tokens=lens,
+                num_tokens_per_req=8,
+                select_index=select if fused_prepare else lens.long().cumsum(0) - 1,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+        if cache_batch:
+            if not getattr(self.owner.server_args, "disable_overlap_schedule", False):
+                raise ValueError("Cached private QSA batches require serial scheduling")
+            cache = getattr(self, "_append_batch_cache", None)
+            if cache is None:
+                from sglang.srt.speculative.dmtp_qsa_batch import QSAAppendBatchCache
+
+                cache = self._append_batch_cache = QSAAppendBatchCache(
+                    self.owner.server_args.max_running_requests
+                )
+            batch = cache.build(batch_fields, spec_fields, totals_cpu)
+        else:
+            batch_fields["seq_lens_cpu"] = (
+                None if gpu_only else torch.tensor(totals_cpu, dtype=torch.int32)
+            )
+            batch_fields["spec_info"] = (
+                EagleDraftExtendInput(**spec_fields)
+                if decode
+                else SimpleNamespace(hidden_states=hc, custom_mask=None, kv_indptr=None)
+            )
+            batch = ForwardBatch(**batch_fields)
+        if prepared is not None:
+            batch._dmtp_prepared_staging = prepared.buffers
         translator = self.runner.runner_ids
         plan = translator.plan(
             req_pool_indices=req_indices,
@@ -364,17 +475,7 @@ class NativeQSAMTP:
         )
         plan.bind(batch, translator)
         if decode:
-            from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-
-            batch.spec_info = EagleDraftExtendInput(
-                hidden_states=hc,
-                num_correct_drafts=lens - 1,
-                num_accept_tokens=lens,
-                num_tokens_per_req=8,
-                select_index=lens.long().cumsum(0) - 1,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-            )
-            batch.spec_info.extend_seq_lens_cpu = list(lengths)
+            batch.spec_info.extend_seq_lens_cpu = None if gpu_only else list(lengths)
             batch.spec_info.extend_seq_lens_tensor = lens
         self.head_hidden = None
         if decode and self.graph is not None:
@@ -384,7 +485,7 @@ class NativeQSAMTP:
                 snapshot_pool,
             )
 
-            initial_check = len(lengths) not in self.graph.checked
+            initial_check = bs not in self.graph.checked
             first = initial_check or os.getenv("SGLANG_DMTP_QSA_CHECK_ALL") == "1"
             before = (
                 snapshot_pool(self.runner.token_to_kv_pool, locations, req_indices)
@@ -399,7 +500,7 @@ class NativeQSAMTP:
                 )
                 restore_pool(before)
                 with self.execution_scope(), scoped_config(**self.graph_fields):
-                    reference_head, reference_logits = self.graph.eager(len(lengths))
+                    reference_head, reference_logits = self.graph.eager(bs)
                 parity_passed = True
                 try:
                     torch.testing.assert_close(head, reference_head, rtol=0, atol=0)
@@ -427,17 +528,17 @@ class NativeQSAMTP:
                     ):
                         raise
                     logging.getLogger(__name__).warning(
-                        "DMTP_QSA_MTP_GRAPH_RECHECK_DIFFERENCE B=%d rows=%d continuing_generation=True strict_parity=False",
-                        len(lengths),
-                        sum(lengths),
+                        "DMTP_QSA_MTP_GRAPH_RECHECK_DIFFERENCE B=%d capacity_rows=%d continuing_generation=True strict_parity=False",
+                        bs,
+                        tokens.numel(),
                     )
                 restore_pool(after)
-                self.graph.checked.add(len(lengths))
+                self.graph.checked.add(bs)
                 if parity_passed:
                     logging.getLogger(__name__).info(
                         "DMTP_QSA_MTP_GRAPH_STRICT_PASS B=%d mode=DRAFT_EXTEND_V2 rows=%d hidden_logits_exact=True full_compressed_ring_exact=True",
-                        len(lengths),
-                        sum(lengths),
+                        bs,
+                        int(lens.sum()) if gpu_only else sum(lengths),
                     )
             finite = torch.isfinite(head).all()
             if logits is not None:

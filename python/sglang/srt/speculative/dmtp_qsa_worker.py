@@ -32,10 +32,25 @@ def validate_recipe(cfg, profile):
     ):
         if cfg(key):
             raise ValueError(f"DMTP QSA has not validated {key}")
-    if not cfg("disable_overlap_schedule") or not cfg("disable_radix_cache"):
-        raise ValueError(
-            "DMTP QSA currently requires synchronous scheduling without prefix reuse"
+    if not cfg("disable_radix_cache"):
+        raise ValueError("DMTP QSA does not support prefix reuse")
+    if not cfg("disable_overlap_schedule"):
+        required = (
+            "OVERLAP",
+            "MTP_GRAPH",
+            "TWO_DRAFT_GRAPHS",
+            "BATCHED_STATE",
+            "FUSED_PREPARE",
+            "DIRECT_PACK",
+            "GPU_COMMIT",
+            "FUSED_STATE_READ",
         )
+        if any(os.getenv("SGLANG_DMTP_QSA_" + flag, "0") != "1" for flag in required):
+            raise ValueError(
+                "DMTP QSA overlap requires the GPU-owned two-graph state path"
+            )
+        if os.getenv("SGLANG_DMTP_QSA_CACHED_BATCH", "0") == "1":
+            raise ValueError("DMTP QSA overlap cannot cache mutable forward batches")
     if cfg("chunked_prefill_size") != -1 or cfg("quantization") is not None:
         raise ValueError(
             "DMTP QSA requires full prompt prefill and unquantized weights"
@@ -70,6 +85,35 @@ class QSAController:
         self.prepared_embeds = None
         self.graph_used = {}
         self.checked_target = set()
+        self.batched_state = (
+            self.two_graphs and os.getenv("SGLANG_DMTP_QSA_BATCHED_STATE", "0") == "1"
+        )
+        self.state_bank = None
+        self.direct_pack = os.getenv("SGLANG_DMTP_QSA_DIRECT_PACK", "0") == "1"
+        self.gpu_commit = os.getenv("SGLANG_DMTP_QSA_GPU_COMMIT", "0") == "1"
+        self.gpu_request_state = (
+            self.gpu_commit
+            or os.getenv("SGLANG_DMTP_QSA_GPU_REQUEST_STATE", "0") == "1"
+        )
+        self.fused_state_read = (
+            os.getenv("SGLANG_DMTP_QSA_FUSED_STATE_READ", "0") == "1"
+        )
+        self.reuse_slot_ids = os.getenv("SGLANG_DMTP_QSA_REUSE_SLOT_IDS", "0") == "1"
+        if self.fused_state_read and not self.gpu_commit:
+            raise ValueError("Fused T1 reads require GPU commit state")
+        if self.gpu_commit and not self.direct_pack:
+            raise ValueError("GPU QSA commit requires direct packed graph inputs")
+        if self.gpu_request_state and not self.batched_state:
+            raise ValueError(
+                "GPU QSA request checks require the owned batched state bank"
+            )
+        if self.direct_pack and (
+            not self.batched_state
+            or os.getenv("SGLANG_DMTP_QSA_FUSED_PREPARE", "0") != "1"
+        ):
+            raise ValueError(
+                "Direct QSA packing requires batched state and fused graph preparation"
+            )
 
     def init_graphs(self):
         if self.two_graphs:
@@ -119,25 +163,63 @@ class QSAController:
                 batch.reqs[i], lengths[i], int(anchors[i]), head[i].clone()
             )
 
+    def _expected_slot_tensor(self, slots, device):
+        if not getattr(self, "reuse_slot_ids", False):
+            return torch.tensor(slots, device=device, dtype=torch.int64)
+        device = torch.device(device)
+        stream = (
+            torch.cuda.current_stream(device).cuda_stream
+            if device.type == "cuda"
+            else None
+        )
+        key = (tuple(slots), device, stream)
+        previous = getattr(self, "_slot_ids_cache", None)
+        if previous is None or previous[0] != key:
+            # One immutable entry: never overwrite storage queued by overlap.
+            previous = (key, torch.tensor(slots, device=device, dtype=torch.int64))
+            self._slot_ids_cache = previous
+        return previous[1]
+
     def t1(self, batch, block_ids):
         states = []
-        for i, (slot, length, anchor) in enumerate(
-            zip(
-                batch.req_pool_indices.tolist(),
-                batch.seq_lens.tolist(),
-                block_ids[:, 0].tolist(),
-            )
-        ):
-            state = self.states.get(slot)
-            if (
-                state is None
-                or state.request is not batch.reqs[i]
-                or (state.length, state.anchor) != (length, anchor)
+        gpu_state = getattr(self, "gpu_request_state", False)
+        fused_read = getattr(self, "fused_state_read", False)
+        if gpu_state:
+            # Worker Req proxies do not expose scheduler pool indices. Ownership
+            # was recorded from the actual GPU mapping during prefill.
+            owners = {id(state.request): slot for slot, state in self.states.items()}
+            slots = [owners.get(id(request)) for request in batch.reqs]
+            if any(
+                not isinstance(slot, int) or not 0 < slot < self.state_bank.capacity
+                for slot in slots
+            ) or len(set(slots)) != len(slots):
+                raise RuntimeError("Invalid CPU QSA request ownership")
+            expected_slots = self._expected_slot_tensor(slots, block_ids.device)
+            if not fused_read:
+                torch._assert_async(
+                    (expected_slots == batch.req_pool_indices).all(),
+                    "QSA request objects and GPU slots disagree",
+                )
+            for slot, request in zip(slots, batch.reqs):
+                state = self.states.get(slot)
+                if state is None or state.request is not request:
+                    raise RuntimeError("Stale QSA MTP request identity")
+                states.append(state)
+        else:
+            slots = batch.req_pool_indices.tolist()
+            for i, (slot, length, anchor) in enumerate(
+                zip(slots, batch.seq_lens.tolist(), block_ids[:, 0].tolist())
             ):
-                raise RuntimeError("Stale QSA MTP request/anchor/position")
-            states.append(state)
+                state = self.states.get(slot)
+                if (
+                    state is None
+                    or state.request is not batch.reqs[i]
+                    or (state.length, state.anchor) != (length, anchor)
+                ):
+                    raise RuntimeError("Stale QSA MTP request/anchor/position")
+                states.append(state)
+        self.current_slots = slots
         self.batch = batch
-        self.hidden = torch.stack([s.head for s in states])
         self.sampling = batch.sampling_info
         if self.two_graphs:
             if self.mtp_tail.signature() != self.mtp_tail.initial_signature:
@@ -146,21 +228,60 @@ class QSAController:
                 )
             fresh = [i for i, state in enumerate(states) if state.prepared is None]
             if fresh:
+                if fused_read:
+                    # Fresh rows write the bank before the fused read can guard it.
+                    torch._assert_async(
+                        (expected_slots == batch.req_pool_indices).all(),
+                        "QSA request objects and GPU slots disagree",
+                    )
                 indices = torch.tensor(
                     fresh, dtype=torch.int64, device=block_ids.device
                 )
+                if gpu_state:
+                    expected = torch.tensor(
+                        [[states[i].length, states[i].anchor] for i in fresh],
+                        device=block_ids.device,
+                        dtype=torch.int64,
+                    )
+                    torch._assert_async(
+                        (
+                            expected[:, 0] == batch.seq_lens.index_select(0, indices)
+                        ).all()
+                        & (expected[:, 1] == block_ids[indices, 0]).all(),
+                        "QSA initial MTP request/anchor/position mismatch",
+                    )
                 self.mtp_tail.stage(block_ids[indices, 0], self.sampling, indices)
                 # Only the first prompt initialization is eager. Subsequent
                 # states receive these outputs from the previous MTP graph.
-                result = self.mtp_tail.forward(self.hidden.index_select(0, indices))
-                for row, index in enumerate(fresh):
-                    states[index].prepared = tuple(
-                        value[row].clone() for value in result
+                result = self.mtp_tail.forward(
+                    torch.stack([states[i].head for i in fresh])
+                )
+                if self.batched_state:
+                    values = (
+                        *result,
+                        self.mtp_tail.temperatures[: len(fresh)],
+                        self.mtp_tail.greedy_mask[: len(fresh)],
                     )
-                    states[index].sampling = (
-                        self.mtp_tail.temperatures[row].clone(),
-                        self.mtp_tail.greedy_mask[row].clone(),
+                    if gpu_state:
+                        values += (
+                            batch.seq_lens.index_select(0, indices).long(),
+                            block_ids[indices, 0].long(),
+                        )
+                    self.state_bank.save(
+                        batch.req_pool_indices.index_select(0, indices), values
                     )
+                    for index in fresh:
+                        states[index].prepared = True
+                        states[index].head = None
+                else:
+                    for row, index in enumerate(fresh):
+                        states[index].prepared = tuple(
+                            value[row].clone() for value in result
+                        )
+                        states[index].sampling = (
+                            self.mtp_tail.temperatures[row].clone(),
+                            self.mtp_tail.greedy_mask[row].clone(),
+                        )
             from sglang.srt.speculative.dspark_components.dspark_draft import (
                 resolve_greedy_mask,
             )
@@ -171,20 +292,44 @@ class QSAController:
             current_greedy = resolve_greedy_mask(
                 bs=len(states), sampling_info=self.sampling, device=block_ids.device
             )
-            torch._assert_async(
-                (torch.stack([s.sampling[0] for s in states]) == current_temp).all()
-                & (
-                    torch.stack([s.sampling[1] for s in states]) == current_greedy
-                ).all(),
-                "DMTP prefetched T1 sampling parameters changed",
-            )
-            tokens, ids, q, self.prepared_embeds = (
-                torch.stack([s.prepared[j] for s in states]) for j in range(4)
-            )
-            block_ids[:, 1].copy_(tokens[:, 0])
+            if fused_read:
+                tokens, ids, q, self.prepared_embeds = self.state_bank.load_checked(
+                    batch.req_pool_indices,
+                    expected_slots,
+                    batch.seq_lens,
+                    block_ids,
+                    current_temp,
+                    current_greedy,
+                )
+            elif self.batched_state:
+                values = self.state_bank.load(batch.req_pool_indices)
+                tokens, ids, q, self.prepared_embeds, saved_temp, saved_greedy = values[
+                    :6
+                ]
+                if gpu_state:
+                    saved_lengths, saved_anchors = values[6:]
+                    torch._assert_async(
+                        (saved_lengths == batch.seq_lens).all()
+                        & (saved_anchors == block_ids[:, 0]).all(),
+                        "Stale GPU QSA MTP request/anchor/position",
+                    )
+            else:
+                tokens, ids, q, self.prepared_embeds = (
+                    torch.stack([s.prepared[j] for s in states]) for j in range(4)
+                )
+                saved_temp = torch.stack([s.sampling[0] for s in states])
+                saved_greedy = torch.stack([s.sampling[1] for s in states])
+            if not fused_read:
+                torch._assert_async(
+                    (saved_temp == current_temp).all()
+                    & (saved_greedy == current_greedy).all(),
+                    "DMTP prefetched T1 sampling parameters changed",
+                )
+                block_ids[:, 1].copy_(tokens[:, 0])
             self.t1_sparse = (ids, q)
             self.graph_used.update(t1_combined=not fresh, conditioner=not fresh)
             return
+        self.hidden = torch.stack([s.head for s in states])
         result = self.t1_combined.run(self.hidden, block_ids, self.sampling)
         if result is None or not self.t1_combined.last_used:
             raise RuntimeError("QSA T1 combined graph unexpectedly unavailable")
@@ -235,25 +380,87 @@ class QSAController:
             raise RuntimeError("DMTP QSA decode must replay both Target and DF graphs")
         bs, width = candidates.shape
         hc = self._hc(hc, bs * width).view(bs, width, -1)
-        counts = (accept_len + 1).tolist()
-        lengths = torch.tensor(counts, device=candidates.device, dtype=torch.int32)
-        tokens = committed_inputs(candidates, lengths, bonus)
-        totals = new_lengths.tolist()
-        prefixes = [n - c for n, c in zip(totals, counts)]
-        slots = self.batch.req_pool_indices.tolist()
-        valid = torch.arange(width, device=candidates.device)[None] < lengths[:, None]
+        direct_pack = getattr(self, "direct_pack", False)
+        gpu_commit = getattr(self, "gpu_commit", False)
+        if gpu_commit:
+            counts = totals = anchors = None
+        elif direct_pack:
+            counts, totals, anchors = torch.stack(
+                (accept_len + 1, new_lengths, bonus)
+            ).tolist()
+        else:
+            counts = (accept_len + 1).tolist()
+            lengths = torch.tensor(counts, device=candidates.device, dtype=torch.int32)
+            tokens = committed_inputs(candidates, lengths, bonus)
+        if self.batched_state and not direct_pack:
+            totals, anchors = torch.stack((new_lengths, bonus)).tolist()
+        elif not self.batched_state:
+            totals = new_lengths.tolist()
+        prefixes = None if gpu_commit else [n - c for n, c in zip(totals, counts)]
+        slots = (
+            self.current_slots if direct_pack else self.batch.req_pool_indices.tolist()
+        )
         if self.two_graphs:
             self.mtp_tail.stage(bonus, self.sampling)
-        head, _ = self.native.forward(
-            tokens=tokens[valid],
-            hc=hc[valid],
-            req_indices=self.batch.req_pool_indices,
-            locations=locations[valid],
-            prefixes=prefixes,
-            lengths=counts,
-            decode=True,
-        )
+        if direct_pack:
+            from sglang.srt.speculative.dmtp_qsa_pack import pack_committed_inputs
+
+            mapping = getattr(self.native, "private_mapping", None)
+            prepared = pack_committed_inputs(
+                candidates,
+                bonus,
+                hc,
+                locations,
+                self.batch.req_pool_indices,
+                prefixes,
+                counts,
+                mapping.req_to_token if mapping is not None else None,
+                self.native.graph.input_staging,
+                accept_len=accept_len if gpu_commit else None,
+                new_lengths=new_lengths if gpu_commit else None,
+            )
+            head, _ = self.native.forward(
+                tokens=prepared.tokens,
+                hc=prepared.hc,
+                req_indices=self.batch.req_pool_indices,
+                locations=prepared.locations,
+                prefixes=prefixes,
+                lengths=counts,
+                decode=True,
+                prepared=prepared,
+            )
+        else:
+            valid = (
+                torch.arange(width, device=candidates.device)[None] < lengths[:, None]
+            )
+            head, _ = self.native.forward(
+                tokens=tokens[valid],
+                hc=hc[valid],
+                req_indices=self.batch.req_pool_indices,
+                locations=locations[valid],
+                prefixes=prefixes,
+                lengths=counts,
+                decode=True,
+            )
+        if self.batched_state:
+            values = (
+                *self.native.graph.tail_result,
+                self.mtp_tail.temperatures[:bs],
+                self.mtp_tail.greedy_mask[:bs],
+            )
+            if getattr(self, "gpu_request_state", False):
+                values += (new_lengths.long(), bonus.long())
+            self.state_bank.save(self.batch.req_pool_indices, values)
         for i in range(bs):
+            if self.batched_state:
+                self.states[slots[i]] = PrefixState(
+                    self.batch.reqs[i],
+                    None if gpu_commit else totals[i],
+                    None if gpu_commit else anchors[i],
+                    None,
+                    prepared=True,
+                )
+                continue
             self.states[slots[i]] = PrefixState(
                 self.batch.reqs[i], totals[i], int(bonus[i]), head[i].clone()
             )
@@ -319,6 +526,12 @@ class QSAMTPWorker(DFlashWorkerV2):
         self._dmtp_controller.native.alloc_memory_pool(
             memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
         )
+        if self._dmtp_controller.batched_state:
+            from sglang.srt.speculative.dmtp_qsa_state import PrefetchedT1State
+
+            self._dmtp_controller.state_bank = PrefetchedT1State(
+                req_to_token_pool.req_to_token.shape[0]
+            )
 
     def init_attention_backends(self):
         super().init_attention_backends()

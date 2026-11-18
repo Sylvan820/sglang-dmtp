@@ -1,5 +1,6 @@
 """Native draft-extend graphs and complete QSA cache parity snapshots."""
 
+import os
 from functools import wraps
 from types import SimpleNamespace
 
@@ -80,6 +81,29 @@ class QSAMTPGraph:
             raise ValueError("Native QSA MTP graph must capture eight rows per request")
         if getattr(native, "tail", None) is not None:
             native.tail.freeze_outputs()
+        self.fused_prepare = os.getenv("SGLANG_DMTP_QSA_FUSED_PREPARE", "0") == "1"
+        if self.fused_prepare:
+            captured = self.graph_runner.buffers
+            self.input_staging = SimpleNamespace(
+                **{
+                    name: torch.empty_like(getattr(captured, name))
+                    for name in (
+                        "input_ids",
+                        "positions",
+                        "out_cache_loc",
+                        "mrope_positions",
+                        "hidden_states",
+                    )
+                }
+            )
+            device = captured.input_ids.device
+            self.input_staging.totals = torch.empty(
+                self.capacity, dtype=torch.int32, device=device
+            )
+            self.input_staging.correct = torch.empty_like(self.input_staging.totals)
+            self.input_staging.last = torch.empty(
+                self.capacity, dtype=torch.int64, device=device
+            )
 
     def prepare_sink(self):
         metadata = self.runner.attn_backend.forward_metadata.indexer_metadata
@@ -95,21 +119,35 @@ class QSAMTPGraph:
         from copy import copy
 
         staged = copy(batch)
-        for name in ("input_ids", "positions", "out_cache_loc"):
-            value = getattr(batch, name)
-            padded = value.new_zeros(n)
-            padded[:count].copy_(value)
-            setattr(staged, name, padded)
-        staged.mrope_positions = batch.mrope_positions.new_zeros((3, n))
-        staged.mrope_positions[:, :count].copy_(batch.mrope_positions)
-        hc = batch.spec_info.hidden_states.new_zeros(
-            (n, batch.spec_info.hidden_states.shape[1])
-        )
-        hc[:count].copy_(batch.spec_info.hidden_states)
-        select = batch.extend_seq_lens.long().cumsum(0) - 1
+        if getattr(self, "fused_prepare", False):
+            from sglang.srt.speculative.dmtp_qsa_pack import stage_graph_inputs
+
+            buffers = self.input_staging
+            if getattr(batch, "_dmtp_prepared_staging", None) is not buffers:
+                stage_graph_inputs(batch, buffers, n)
+            for name in ("input_ids", "positions", "out_cache_loc"):
+                setattr(staged, name, getattr(buffers, name)[:n])
+            staged.mrope_positions = buffers.mrope_positions[:, :n]
+            hc = buffers.hidden_states[:n]
+            select = batch.spec_info.select_index
+            correct = batch.spec_info.num_correct_drafts
+        else:
+            for name in ("input_ids", "positions", "out_cache_loc"):
+                value = getattr(batch, name)
+                padded = value.new_zeros(n)
+                padded[:count].copy_(value)
+                setattr(staged, name, padded)
+            staged.mrope_positions = batch.mrope_positions.new_zeros((3, n))
+            staged.mrope_positions[:, :count].copy_(batch.mrope_positions)
+            hc = batch.spec_info.hidden_states.new_zeros(
+                (n, batch.spec_info.hidden_states.shape[1])
+            )
+            hc[:count].copy_(batch.spec_info.hidden_states)
+            select = batch.extend_seq_lens.long().cumsum(0) - 1
+            correct = batch.extend_seq_lens - 1
         staged.spec_info = EagleDraftExtendInput(
             hidden_states=hc,
-            num_correct_drafts=batch.extend_seq_lens - 1,
+            num_correct_drafts=correct,
             num_accept_tokens=batch.extend_seq_lens,
             num_tokens_per_req=self.width,
             select_index=select,
