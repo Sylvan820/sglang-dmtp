@@ -6,7 +6,6 @@ from functools import partial
 from pathlib import Path
 
 import torch
-
 from sglang.srt.speculative.mtp_prefix_mask import build_full_prefix_mask
 from sglang.srt.speculative.native_sglang_mtp import NativeSGLangMTP
 

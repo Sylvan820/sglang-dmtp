@@ -1,7 +1,6 @@
 """Operator tails recorded in the MTP and DF parent graphs, not child replays."""
 
 import torch
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.speculative.dmtp_head_conditioner_graph import conditioned_embeddings
 from sglang.srt.speculative.dmtp_selector_graph import (

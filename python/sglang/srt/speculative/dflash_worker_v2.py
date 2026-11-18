@@ -4,7 +4,6 @@ import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -2648,9 +2647,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
             if self._dmtp_controller is not None:
-                self._dmtp_controller.prefill(
-                    batch, next_token_ids, logits_output.hidden_states
-                )
+                if getattr(self._dmtp_controller, "uses_hc", False):
+                    self._dmtp_controller.prefill(
+                        batch, next_token_ids, logits_output.dmtp_target_hc
+                    )
+                    logits_output.dmtp_target_hc = None
+                else:
+                    self._dmtp_controller.prefill(
+                        batch, next_token_ids, logits_output.hidden_states
+                    )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -3285,6 +3290,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if dmtp is not None:
             dmtp.graph_used["target"] = bool(can_run_cuda_graph)
+            hc_kwargs = (
+                {"hc": logits_output.dmtp_target_hc}
+                if getattr(dmtp, "uses_hc", False)
+                else {}
+            )
             dmtp.commit(
                 candidates,
                 accept_len,
@@ -3292,7 +3302,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 hidden,
                 new_seq_lens,
                 verify_out_cache_loc_2d,
+                **hc_kwargs,
             )
+            if hc_kwargs:
+                logits_output.dmtp_target_hc = None
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).

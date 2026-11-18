@@ -5,7 +5,6 @@ from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
-
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
@@ -326,6 +325,18 @@ class SpeculativeAlgorithm(Enum):
             import os
 
             if os.getenv("SGLANG_DMTP_T1_RESIDUAL", "0") == "1":
+                from sglang.srt.hf_transformers.config import get_config
+                from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+                config = get_config(
+                    server_args.model_path,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+                if is_qwen_qsa(config):
+                    from sglang.srt.speculative.dmtp_qsa_worker import QSAMTPWorker
+
+                    return QSAMTPWorker
                 from sglang.srt.speculative.dmtp_worker import DMTPWorkerV2
 
                 return DMTPWorkerV2
