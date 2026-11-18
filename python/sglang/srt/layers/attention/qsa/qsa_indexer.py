@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import torch
-
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
@@ -34,6 +33,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+from sglang.srt.runtime_context import get_exec
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -236,9 +236,7 @@ class QSAIndexer(MultiPlatformOp):
     ) -> None:
         """Fused mean -> gemma norm -> MRoPE -> compressed-cache store;
         a None source_keys/source_rope reads the members from the pending ring."""
-        from sglang.kernels.ops.attention.qsa_indexer import (
-            qsa_index_k_compress_store,
-        )
+        from sglang.kernels.ops.attention.qsa_indexer import qsa_index_k_compress_store
 
         if source_keys is None:
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
@@ -271,6 +269,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths=metadata.sequence_lengths,
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
+            ring_size=metadata.token_to_kv_pool.qsa_ring_size,
             is_extend=is_extend,
         )
 
@@ -282,6 +281,7 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            ring_size=metadata.token_to_kv_pool.qsa_ring_size,
         )
 
     def update_key_state_and_compress(
@@ -338,7 +338,7 @@ class QSAIndexer(MultiPlatformOp):
                 )
         else:
             # Paged eager rows (speculative fallback) complete at most one
-            # group each; its members are exactly the pending ring window.
+            # group each; the pending ring still holds all of its members.
             group_locs = metadata.compress_group_ring_locs
             if group_locs is None:
                 group_locs = self._group_ring_slots(
@@ -534,6 +534,7 @@ class QSAIndexer(MultiPlatformOp):
             q.is_cuda
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
+            and not get_exec().deterministic.enable_deterministic_inference
         )
         logits = qsa_mqa_decode(
             q,

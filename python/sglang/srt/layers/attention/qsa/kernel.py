@@ -7,8 +7,8 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_hip
 
 
@@ -34,7 +34,10 @@ def qsa_fast_topk(
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
     if logits.is_cuda:
-        if is_batch_invariant_mode_enabled() and not is_hip():
+        if (
+            is_batch_invariant_mode_enabled()
+            or get_exec().deterministic.enable_deterministic_inference
+        ) and not is_hip():
             from flashinfer import TopKTieBreak, top_k_ragged_transform
 
             return top_k_ragged_transform(
