@@ -19,7 +19,6 @@ from typing import Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
-
 from sglang.srt.configs.all_configs import (
     AfmoeConfig,
     BailingHybridConfig,
@@ -101,6 +100,7 @@ from sglang.srt.configs.all_configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
+from sglang.srt.configs.qwen4_dmtp import Qwen4DMTPDraftConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
@@ -195,6 +195,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ]
 }
 
+
+_CONFIG_REGISTRY[Qwen4DMTPDraftConfig.model_type] = Qwen4DMTPDraftConfig
 
 # DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
 # transformers class with each model_type so AutoConfig.register passes its
