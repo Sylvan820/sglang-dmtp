@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from torch import nn
-
 from sglang.kernels.ops.activation.softcap import (
     cast_to_float32_logits,
     gathered_softcap_logits,
@@ -30,9 +28,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
-from sglang.kernels.ops.activation.softcap import (
-    softcap_to_float32_logits,
-)
+from sglang.kernels.ops.activation.softcap import softcap_to_float32_logits
 from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
@@ -78,6 +74,7 @@ from sglang.srt.utils.device import (
     is_pin_memory_available,
     use_intel_amx_backend,
 )
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +202,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Separate from DFlash's completed-layer means and from the H-wide head input.
+    dmtp_target_hc: Optional[torch.Tensor] = None
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None

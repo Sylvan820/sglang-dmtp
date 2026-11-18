@@ -5,7 +5,6 @@ import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
@@ -132,6 +131,8 @@ class GatedResidual(HyperConnectionBase):
         role: Optional[str] = None,
     ):
         super().__init__(config, use_mix, use_combine, role)
+
+        self.allow_nondeterministic_mix = True
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -307,7 +308,7 @@ class GatedResidual(HyperConnectionBase):
             mixed_input = hc_mix(hyper_input_normed, *self._mix_flydsl_weights).to(
                 self.params_dtype
             )
-        elif fused_hc_mix_supported(
+        elif self.allow_nondeterministic_mix and fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
@@ -409,9 +410,7 @@ class GatedResidual(HyperConnectionBase):
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
             if self._split_combine_ok and block_output.shape[0] <= 32:
-                from sglang.kernels.ops.elementwise.hc_combine import (
-                    hc_combine_split,
-                )
+                from sglang.kernels.ops.elementwise.hc_combine import hc_combine_split
 
                 return hc_combine_split(
                     block_output,
