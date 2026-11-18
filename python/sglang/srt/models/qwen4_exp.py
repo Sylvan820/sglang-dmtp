@@ -12,8 +12,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -59,9 +57,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptMixedPrecisionConfig,
-)
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -101,6 +97,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
+from torch import nn
 
 _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -551,9 +548,7 @@ def _use_qwen4_varlen_prefill(
         or query_start_loc is None
     ):
         return False
-    from sglang.kernels.ops.mamba.qwen4_short_conv import (
-        can_fuse_qwen4_varlen_conv,
-    )
+    from sglang.kernels.ops.mamba.qwen4_short_conv import can_fuse_qwen4_varlen_conv
 
     return can_fuse_qwen4_varlen_conv(
         x,
@@ -1945,9 +1940,9 @@ class Qwen4ExpAttentionDecoderLayer(
             )
             # A capture records the bridge it is given; the warmup before it
             # allocates one.
-            assert output is not None or _current_capture_var.get() is None, (
-                "qsa top-k bridge not allocated before capture"
-            )
+            assert (
+                output is not None or _current_capture_var.get() is None
+            ), "qsa top-k bridge not allocated before capture"
             _breakable_qsa_indexer(
                 layer=self,
                 hidden_states=hidden_states,
@@ -2241,6 +2236,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
             normalized_input = norms.output
+            if i in getattr(self, "_dflash_completed_layer_ids", ()):
+                assert not shards_rows, "DFlash2 capture is validated for TP1/CP1"
+                assert hidden_states.shape[-1] == self.hc_count * self.hidden_size
+                aux_hidden_states.append(
+                    hidden_states.unflatten(-1, (self.hc_count, self.hidden_size)).mean(
+                        dim=-2
+                    )
+                )
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2270,6 +2273,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 if capture is not None and capture.need_capture()
                 else None
             )
+        if getattr(self, "_dmtp_capture_hc", False):
+            # A graph-owned output, not a Python hook which only runs at capture.
+            self.last_dmtp_hc = hc_hidden_states.clone()
+        if getattr(self, "_dflash_completed_layer_ids", ()):
+            return hidden_states, aux_hidden_states
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
@@ -2314,6 +2322,8 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         )
         if isinstance(model_output, PPProxyTensors):
             return model_output
+        if getattr(self, "_dflash_completed_layer_ids", ()):
+            return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
@@ -2351,6 +2361,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
 
+    def set_dflash_layers_to_capture(self, layer_ids):
+        assert self.pp_group.is_last_rank
+        assert list(layer_ids) == [5, 15, 25, 35, 45], layer_ids
+        self.capture_aux_hidden_states = True
+        self.model._dflash_completed_layer_ids = tuple(layer_ids)
+        for layer in self.model.layers:
+            layer._is_layer_to_capture = False
+
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
@@ -2375,6 +2393,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
+        if getattr(self.model, "_dmtp_capture_hc", False) and isinstance(
+            output, LogitsProcessorOutput
+        ):
+            output.dmtp_target_hc = self.model.last_dmtp_hc
         return output
 
     def _load_qwen4_exp_ple_buffer(
@@ -2748,9 +2770,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
                     if name.endswith("_scale") and name not in params_dict:
-                        assert abs(loaded_weight.item() - 1.0) < 1e-6, (
-                            f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
-                        )
+                        assert (
+                            abs(loaded_weight.item() - 1.0) < 1e-6
+                        ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
                         continue
                     if name in params_dict:
                         param = params_dict[name]

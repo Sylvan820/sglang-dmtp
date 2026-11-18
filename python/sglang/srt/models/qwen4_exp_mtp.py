@@ -6,9 +6,6 @@ from contextlib import ExitStack
 from typing import Optional
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -21,6 +18,8 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_conf
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import is_npu
+from torch import nn
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +165,8 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         hc_hidden_states: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> None:
+        if getattr(self, "_dmtp_qsa_normalized_output", False):
+            return
         if hc_hidden_states is None:
             return
 
