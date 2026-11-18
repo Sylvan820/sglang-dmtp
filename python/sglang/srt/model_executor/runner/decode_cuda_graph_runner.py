@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union, cast
 
 import torch
 import tqdm
-
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
@@ -2172,6 +2171,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 last_hidden_states=(
                     output.last_hidden_states[: self.raw_num_token]
                     if output.last_hidden_states is not None
+                    else None
+                ),
+                dmtp_target_hc=(
+                    output.dmtp_target_hc[: self.raw_num_token]
+                    if output.dmtp_target_hc is not None
                     else None
                 ),
             )
