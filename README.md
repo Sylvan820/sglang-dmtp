@@ -1,6 +1,9 @@
 # DMTP: A Better First Token for Block Drafting via MTP
 
-[Blog (English / Chinese)](https://sylvan820.github.io/D-MTP/) | [Models](https://huggingface.co/Piggy12) | [SGLang PR](https://github.com/sgl-project/sglang/pull/50270)
+[![Blog](https://img.shields.io/badge/Blog-EN%20%2F%20ZH-0f766e?style=flat-square&logo=readthedocs&logoColor=white)](https://sylvan820.github.io/D-MTP/)
+[![Models](https://img.shields.io/badge/Models-Hugging%20Face-ffcc4d?style=flat-square&logo=huggingface&logoColor=black)](https://huggingface.co/Piggy12)
+[![SGLang PR](https://img.shields.io/badge/SGLang-PR%20%2350270-2563eb?style=flat-square&logo=github&logoColor=white)](https://github.com/sgl-project/sglang/pull/50270)
+[![SpecForge PR](https://img.shields.io/badge/SpecForge-PR%20%231189-7c3aed?style=flat-square&logo=github&logoColor=white)](https://github.com/sgl-project/SpecForge/pull/1189)
 
 DMTP combines pretrained native MTP with parallel DFlash2 drafting. MTP proposes the first token; DFlash2 uses that proposal and its predictive representation to draft the remaining block in parallel. The target verifies the combined proposals.
 
