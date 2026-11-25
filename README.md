@@ -26,7 +26,6 @@ See the [blog](https://sylvan820.github.io/D-MTP/) for motivation, ablations, an
 | Draft | Target | Runtime |
 | :--- | :--- | :--- |
 | [Qwen3.6-27B-DMTP](https://huggingface.co/Piggy12/Qwen3.6-27B-DMTP) | [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) | Dense FA3 |
-| [Qwen3.8-27B-DMTP](https://huggingface.co/Piggy12/Qwen3.8-27B-DMTP) | Qwen3.8-27B | See model card |
 | [Qwen3.8-next-120b-dmtp](https://huggingface.co/Piggy12/Qwen3.8-next-120b-dmtp) | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | HC/QSA |
 
 These repositories contain draft weights only. Matching target weights, native MTP, shared embeddings, and the language-model head are supplied separately.
