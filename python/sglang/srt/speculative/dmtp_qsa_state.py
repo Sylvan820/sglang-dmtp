@@ -55,10 +55,17 @@ class PrefetchedT1State:
         return values
 
     def load_checked(
-        self, slots, expected_slots, lengths, block_ids, temperatures, greedy
+        self,
+        slots,
+        expected_slots,
+        lengths,
+        block_ids,
+        temperatures,
+        greedy,
+        valid_slots=None,
     ):
         values, valid = self._checked_values(
-            slots, expected_slots, lengths, block_ids, temperatures, greedy
+            slots, expected_slots, lengths, block_ids, temperatures, greedy, valid_slots
         )
         torch._assert_async(
             valid.all(), "Stale QSA T1 slot/length/anchor/sampling state"
@@ -66,7 +73,14 @@ class PrefetchedT1State:
         return values
 
     def _checked_values(
-        self, slots, expected_slots, lengths, block_ids, temperatures, greedy
+        self,
+        slots,
+        expected_slots,
+        lengths,
+        block_ids,
+        temperatures,
+        greedy,
+        valid_slots=None,
     ):
         if (
             self.buffers is None
@@ -78,6 +92,13 @@ class PrefetchedT1State:
         ):
             raise ValueError("Checked T1 reads require GPU request state fields")
         bs = slots.numel()
+        if valid_slots is not None and (
+            valid_slots.shape != (self.capacity,)
+            or valid_slots.dtype != torch.bool
+            or valid_slots.device != slots.device
+            or not valid_slots.is_contiguous()
+        ):
+            raise ValueError("Invalid T1 request validity storage")
         if (
             slots.ndim != 1
             or slots.dtype != torch.int64
@@ -121,6 +142,8 @@ class PrefetchedT1State:
                 temperatures,
                 greedy,
                 valid,
+                valid_slots if valid_slots is not None else slots,
+                valid_slots is not None,
                 widths,
                 self.capacity,
                 slots.stride(0),
@@ -142,6 +165,8 @@ class PrefetchedT1State:
                 & (self.buffers[4][safe] == temperatures)
                 & (self.buffers[5][safe] == greedy)
             )
+            if valid_slots is not None:
+                valid &= valid_slots[safe]
             for value, buffer in zip(values, self.buffers):
                 torch.index_select(buffer, 0, safe, out=value)
             block_ids[:, 1] = torch.where(valid, values[0][:, 0], block_ids[:, 1])
@@ -190,6 +215,8 @@ def _load_checked(
     TEMP,
     GREEDY,
     VALID,
+    VALID_SLOTS,
+    HAS_VALID: tl.constexpr,
     WIDTHS: tl.constexpr,
     CAPACITY: tl.constexpr,
     S0: tl.constexpr,
@@ -213,6 +240,8 @@ def _load_checked(
         tl.store(OUTPUTS[field] + row * width + offset, value, offset < width)
     if tile == 0:
         ok = bounded & (slot == tl.load(EXPECTED + row * E0))
+        if HAS_VALID:
+            ok &= tl.load(VALID_SLOTS + slot, bounded, other=0)
         ok &= tl.load(SOURCES[6] + slot, bounded, other=0) == tl.load(
             LENGTHS + row * L0
         )
