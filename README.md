@@ -128,11 +128,10 @@ Runtime code retains SGLang's [Apache-2.0 license](LICENSE). DMTP draft weight l
 
 ```bibtex
 @misc{shen2026dmtp,
-  author = {Shen, Yuhao and Huang, Jianuo},
+  author = {Shen, Yuhao and Huang, Jianuo and Zhang, Yi and Yang, Xu and Yu, Hao and Wang, Xin and Li, Yucheng and Jiang, Huiqiang and Lin, Xi and Liu, Di and Zhang, Jun and Liu, Tianyu and Zheng, Bo and Liu, Dayiheng and Zhang, Jianwei and Wang, Cong},
   title  = {{DMTP}: A Better First Token for Block Drafting via MTP},
   year   = {2026},
-  url    = {https://sylvan820.github.io/D-MTP/},
-  note   = {Technical blog}
+  url    = {https://sylvan820.github.io/D-MTP/}
 }
 ```
 
