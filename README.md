@@ -108,6 +108,10 @@ The response includes generated text and request metadata. Both launchers bind t
 
 Validate output correctness and performance on the exact hardware, checkpoint, and serving configuration before deployment.
 
+## Upcoming Releases
+
+We will also release DMTP checkpoints for smaller Qwen4 models in future updates.
+
 ## Implementation
 
 - [DMTP worker](python/sglang/srt/speculative/dmtp_worker.py): shared entry point and dense drafting.
